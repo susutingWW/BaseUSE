@@ -1,0 +1,48 @@
+# BaseUSE experiment: BSRNN (discriminative) on pre-simulated URGENT 2025 data
+#
+# Requires an offline-simulated training set (spk1.scp / wav.scp / utt2fs /
+# speech_length.scp) under train_set_path. To create it later, simulate from
+# the dynamic-mixing manifests with baseuse.simulation scripts:
+#   1) baseuse.simulation.generate_data_param  -> meta.tsv
+#   2) baseuse.simulation.simulate_data_from_param -> audio + scps
+# (several hundred GB of disk; the dynamic-mixing experiment above needs none)
+
+data:
+  train:
+    type: pre_simulated
+    path: data/train_simulation_2025
+    max_duration: 96000
+  validation:
+    type: pre_simulated
+    path: data/val_2025
+
+train_set_path: data/train_simulation_2025
+train_set_dynamic_mixing: false
+valid_set_path: data/val_2025
+max_duration: 96000
+use_high_pass: true
+
+batch_size: 4
+num_worker: 2
+val_check_interval: 5000
+device: "cuda"
+num_gpu: 1
+learning_rate: 1.0e-3
+lr_step_size: 1
+lr_gamma: 0.85
+gradient_clip: 0.5
+weight_decay: 1.0e-6
+adam_epsilon: 1.0e-8
+num_train_epochs: 80
+train_version: 0
+train_name: 'bsrnn_2025sim'
+save_top_k: 5
+resume: true
+seed: 2024
+
+model_type: "discriminative"
+init_from: 'none'
+se_model: bsrnn
+model_configs:
+  num_channel: 196
+  num_layer: 6

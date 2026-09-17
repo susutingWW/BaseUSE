@@ -1,0 +1,230 @@
+# BaseUSE experiment: SEMamba + LENGTH-MASKED LOSSES.
+#
+# This is a controlled variant of semamba_2025_dynamic.yaml differing in exactly
+# ONE knob: model_configs.length_mask_loss = true. Everything else (data,
+# balanced sampling, SFI geometry 510/120, loss weights, optimizer, 4-GPU /
+# global batch 32, hid_feature 64, gc/fp32 flags) is identical, so the two runs
+# isolate the effect of computing losses over the batch's zero padding.
+#
+# WHY: collate pads every batch to its longest member and the upstream recipe
+# averages all five loss terms over that padded length. URGENT's val clips span
+# 0.5 s - 15 s, so a short clip is ~96% padding. scripts/semamba_selftest.py S8
+# measures the resulting dilution at a 40%-padding ratio: magnitude MSE 0.0100
+# -> 0.0040 and time L1 0.0396 -> 0.0159 (both -60%), phase ip/gd/iaf -> ~40%
+# of their true value. Masked, every term is invariant to padding; with an
+# all-ones mask the result is bit-identical to the legacy path.
+#
+# !!! METRIC COMPARABILITY WARNING !!!
+# This run's loss / val_loss are a DIFFERENT QUANTITY from
+# semamba_2025_dynamic.yaml's (larger, because padding no longer dilutes them).
+# Do NOT compare val_loss across the two runs directly. Compare either
+#   - val_sisnr (now a true, per-clip-length SI-SNR in both runs), or
+#   - downstream URGENT objective metrics on the enhanced output.
+# The training objective also changes: loss_time is no longer diluted, so the
+# effective weight of the time-domain term rises.
+
+# Usage:
+#   bash scripts/train.sh semamba-lenmask
+#   python -m baseuse.train --config_file conf/exp/semamba_2025_lenmask.yaml
+#
+# Model: https://github.com/roychao19477/semamba (IEEE SLT 2024, URGENT 2024
+# challenge 4th place). DenseEncoder -> 4 x TFMambaBlock -> (MagDecoder,
+# PhaseDecoder); mag and pha decoders share the same backbone output.
+#
+# This file is a sibling of rwsamamba_2025_dynamic.yaml and deliberately keeps
+# EVERY other knob identical (same data, same balanced sampling, same SFI-STFT
+# geometry 510/120, same loss weights, same optimizer, same 4-GPU / global
+# batch 32) so the two backbones are directly comparable. Differences:
+#   - se_model: semamba (flat) instead of rwsamamba_unet (5-stage U-Net)
+#   - hid_feature: 64 (SEMamba's upstream size) instead of 16. Measured param
+#     counts: flat SEMamba 2.268M vs RWSA-UNet (pure Mamba) 1.888M, i.e. this
+#     backbone is ~1.2x larger - NOT param-matched (see the model section).
+#   - padding policy: F even / T unconstrained (handled in semamba_se.py)
+#   - NOT ported from upstream, by design: MetricDiscriminator + PESQ-in-the-
+#     loop (loss.metric 0.05), PCS400 post-processing, and upstream's
+#     compute_stft (2 bugs: mag uses real^2*imag^2, atan2 args swapped).
+#   - STFT geometry stays 510/120 (31.875 ms / 7.5 ms) rather than upstream's
+#     400/100 (25 ms / 6.25 ms): keeping it identical to RWSA is what makes the
+#     A/B meaningful. Upstream trains 16 kHz only; here one weight set serves
+#     8k-48k through the SFI encoder.
+#
+# Before the first full run, measure this backbone's step time + peak memory:
+#   python scripts/diagnose_step_time.py --part b \
+#       --config_file conf/exp/semamba_2025_dynamic.yaml
+# then adjust batch_size / grad_checkpoint (see their comments).
+
+# ================= data (same recipe as rwsamamba_2025_dynamic.yaml) =================
+data:
+  train:
+    type: dynamic_mixing
+    path: data/train_sources_2025
+    max_duration: 96000          # sample-count cap (2s @ 48kHz / 12s @ 8kHz)
+    max_duration_sec: 4.0        # seconds cap; 4s ~= 2x the upstream paper's
+                                 # 1.92s segments (SEMamba upstream: 32000
+                                 # samples = 2s @16k). Keep 4.0 for parity with
+                                 # the RWSA run.
+    use_high_pass: true
+    retry_when_fails: true       # fall back to clean speech if simulation fails
+    # GAP-URGENet style epoch sampling: each epoch draws num_per_epoch
+    # utterances WITH REPLACEMENT, split evenly across the 6 corpus pools.
+    # 40 epochs x 40k = 1.6M 4s-segments. With 4 GPUs x bs=8 (global 32) one
+    # epoch is 40000/32 = 1250 optimizer steps; 40 epochs = 50k steps.
+    sampling:
+      strategy: balanced
+      num_per_epoch: 40000
+      # pool_keywords: [dns5_fullband, vctk, libritts, commonvoice, mls_segments, ears]
+    simulation:                  # defaults replicate the official 2026 baseline
+      snr_low_bound: -5.0
+      snr_high_bound: 20.0
+      reuse_noise: true
+      prob_wind_noise: 0.05
+      prob_reverberation: 0.5
+      reuse_rir: true
+      num_augmentations:
+        0: 0.25
+        1: 0.40
+        2: 0.20
+        3: 0.15
+      wind_noise_config:
+        threshold: [0.1, 0.3]
+        ratio: [1, 20]
+        attack: [5, 100]
+        release: [5, 100]
+        sc_gain: [0.8, 1.2]
+        clipping_threshold: [0.85, 1.0]
+        clipping_chance: 0.75
+        wind_noise_snr_low_bound: -10.0
+        wind_noise_snr_high_bound: 15.0
+      augmentations:
+        bandwidth_limitation:
+          weight: 1.0
+          resample_methods: random
+        clipping:
+          weight: 1.0
+          clipping_min_quantile: [0.0, 0.1]
+          clipping_max_quantile: [0.9, 1.0]
+        codec:
+          weight: 1.0
+          config:
+            - format: mp3
+              encoder: null
+              qscale: [1, 10]
+            - format: ogg
+              encoder: [vorbis]
+              qscale: [1, 10]
+        packet_loss:
+          weight: 1.0
+          packet_duration_ms: 20
+          max_continuous_packet_loss: 10
+          packet_loss_rate: [0.05, 0.25]
+  validation:
+    type: pre_simulated
+    path: data/val_2025
+    max_duration: -1             # no truncation: evaluate full-length clips
+    max_duration_sec: null
+
+# ============ legacy flat data fields (fallback when `data:` is absent) ============
+train_set_path: data/train_sources_2025
+train_set_dynamic_mixing: true
+valid_set_path: data/val_2025
+max_duration: 96000
+use_high_pass: true
+
+# ================= training =================
+# 4-GPU DDP: global batch = 4 x 8 = 32 (== upstream single-GPU bs=32, so the
+# lr=5e-4 recipe stays valid). steps/epoch = 40000 / 32 = 1250.
+batch_size: 8                     # PER GPU. KEEP at 8: diagnose --part b measured
+                                  # throughput as EXACTLY flat in batch size
+                                  # (bs=8 -> 1.53 s/step = 5.24 samples/s;
+                                  #  bs=16 -> 3.05 s/step = 5.24 samples/s, peak
+                                  #  123.5 GiB). The flat SEMamba is bandwidth /
+                                  # kernel-latency bound, so a bigger batch buys
+                                  # nothing and only raises the peak; raising it
+                                  # would also break global batch 4x8=32, which is
+                                  # what the lr=5e-4 recipe is calibrated for.
+                                  # Measured peak at bs=8 @48k: 61.7 GiB, and the
+                                  # device accepted a 123.5 GiB allocation
+                                  # without OOM -> it is >=124 GiB (NOT an 80 GB
+                                  # card; confirm with nvidia-smi).
+num_worker: 32                    # PER RANK (4 ranks = 128 sim workers)
+val_check_interval: 1200          # must stay <= steps/epoch (1250): PL raises on
+                                  # int val_check_interval > num train batches.
+                                  # ~1 val/epoch over the 2168-clip val set.
+device: "cuda"
+num_gpu: 4
+precision: "bf16-mixed"
+learning_rate: 5.0e-4            # upstream SEMamba training_cfg.learning_rate
+lr_step_size: 1
+lr_gamma: 0.99                   # upstream SEMamba lr_decay (per epoch); used only
+                                 # as fallback when lr_decay_steps=0
+lr_decay_steps: 50000            # == total optimizer steps (40 epochs x 1250).
+                                 # RE-DERIVE if batch_size changes:
+                                 # steps/epoch = 40000 / (4 * batch_size).
+lr_decay_factor: 0.1
+weight_decay: 0.01
+gradient_clip: 0.5               # upstream trainer did not clip; kept for safety
+num_train_epochs: 40             # 40 x 40k = 1.6M samples, same budget as RWSA
+train_version: 0
+train_name: 'semamba_lenmask_2025dm'
+save_top_k: 5
+resume: true
+seed: 2024
+
+# ================= model =================
+# Measured: flat SEMamba (hid=64, num_tfmamba=4) = 2,267,782 params
+# (dense_encoder 382,592 + mask_decoder 387,076 + phase_decoder 386,562
+#  + TSMamba 1,111,552). The LearnableSigmoid2D table inside mask_decoder holds
+# 766 rows because it is sized for max_fs=48 kHz (upstream SEMamba is 16 kHz
+# only, with 201 rows); at runtime it is sliced to the current bin count, which
+# is valid because SFI-STFT bin k maps to the same physical frequency at every
+# sampling rate.
+# FAIRNESS CAVEAT for the A/B vs rwsamamba_2025_dynamic.yaml: the RWSA-UNet
+# config there measures 1.888M (hid=16, pure Mamba), so this backbone is ~1.2x
+# larger. hid ~= 57 would be param-matched, but 64 is kept because it is
+# upstream's official setting (D3). Report params alongside any metric gap.
+model_type: "discriminative"
+init_from: 'none'
+se_model: semamba
+model_configs:
+  hid_feature: 64                # upstream SEMamba model_cfg.hid_feature
+  num_tfmamba: 4                 # upstream SEMamba model_cfg.num_tfmamba
+  d_state: 16
+  d_conv: 4
+  expand: 4
+  norm_epsilon: 1.0e-5
+  beta: 2.0                      # LearnableSigmoid2D slope init
+  compress_factor: 0.3
+  grad_checkpoint: false         # MEASURED (diagnose --part b, bs=8, bf16 autocast):
+                                 #   gc=True  -> 48k 1.53 s/step, peak 61.8 GiB
+                                 #   gc=False -> 48k 1.20 s/step, peak 61.7 GiB
+                                 # i.e. it saves 0.1 GiB and costs 27% time: the
+                                 # flat backbone has no U-Net skip copies, so the
+                                 # checkpoint segment does not hold the peak
+                                 # (the fp32 scan intermediates do).
+                                 # Turn back on ONLY if you later run on a much
+                                 # smaller card than the measured 124+ GiB device.
+  mamba_fp32: true               # keep the selective scan in fp32 under bf16
+                                 # autocast. Measured cost is small (1.20 s ->
+                                 # 1.13 s, i.e. 6%) while it buys 23 GiB less
+                                 # memory we do not need; the documented NaN
+                                 # risk of the bf16 scan (~30% of steps dropped)
+                                 # is not worth 6%. A/B it via the NaN print.
+  # SFI-STFT (reference at 16 kHz; window/hop duration constant across fs).
+  # Kept identical to rwsamamba_2025_dynamic.yaml on purpose.
+  base_fs: 16000
+  n_fft: 510
+  hop_length: 120
+  win_length: 510
+  max_fs: 48000
+  # THE ONLY DIFFERENCE vs semamba_2025_dynamic.yaml: average every loss term
+  # over valid samples/frames instead of over the batch's zero padding, and
+  # score the SI-SNR metric on each clip's true length. Verified padding-
+  # invariant by scripts/semamba_selftest.py S8 (all-ones mask is bit-identical
+  # to the legacy unmasked value). See the comparability warning in the header.
+  length_mask_loss: true
+  # generator loss weights (upstream training_cfg.loss, metric/GAN term dropped)
+  loss_mag: 0.9
+  loss_pha: 0.3
+  loss_com: 0.1
+  loss_time: 0.2
+  loss_con: 0.1

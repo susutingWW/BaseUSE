@@ -1,0 +1,106 @@
+# BaseUSE experiment: BSRNN (discriminative) trained on URGENT 2025 data, dynamic mixing
+#
+# Usage:
+#   python -m baseuse.train --config_file conf/exp/bsrnn_2025_dynamic.yaml
+#
+# Prerequisite (once, before the first run):
+#   python -m baseuse.data.build_urgent2025 \
+#       --urgent25_path /mnt/data/share-oss/user/wangsuting/workspace/USE/urgent2025_challenge \
+#       --output_root data
+#
+# NOTE: with the full ~1.4M-utterance pool one "epoch" is ~350k steps at bs=4.
+# Checkpoints are selected by val_loss every `val_check_interval` steps; stop
+# the run when validation metrics plateau instead of waiting for 80 epochs.
+
+# ================= data =================
+data:
+  train:
+    type: dynamic_mixing
+    path: data/train_sources_2025
+    max_duration: 96000          # 2s @ 48kHz / 6s @ 16kHz
+    use_high_pass: true
+    retry_when_fails: true       # fall back to clean speech if simulation fails
+    simulation:                  # defaults replicate the official 2026 baseline
+      snr_low_bound: -5.0
+      snr_high_bound: 20.0
+      reuse_noise: true
+      prob_wind_noise: 0.05
+      prob_reverberation: 0.5
+      reuse_rir: true
+      num_augmentations:
+        0: 0.25
+        1: 0.40
+        2: 0.20
+        3: 0.15
+      wind_noise_config:
+        threshold: [0.1, 0.3]
+        ratio: [1, 20]
+        attack: [5, 100]
+        release: [5, 100]
+        sc_gain: [0.8, 1.2]
+        clipping_threshold: [0.85, 1.0]
+        clipping_chance: 0.75
+        wind_noise_snr_low_bound: -10.0
+        wind_noise_snr_high_bound: 15.0
+      augmentations:
+        bandwidth_limitation:
+          weight: 1.0
+          resample_methods: random
+        clipping:
+          weight: 1.0
+          clipping_min_quantile: [0.0, 0.1]
+          clipping_max_quantile: [0.9, 1.0]
+        codec:
+          weight: 1.0
+          config:
+            - format: mp3
+              encoder: null
+              qscale: [1, 10]
+            - format: ogg
+              encoder: [vorbis]
+              qscale: [1, 10]
+        packet_loss:
+          weight: 1.0
+          packet_duration_ms: 20
+          max_continuous_packet_loss: 10
+          packet_loss_rate: [0.05, 0.25]
+  validation:
+    type: pre_simulated
+    path: data/val_2025          # built from urgent2025 data/validation
+    max_duration: 96000          # cap val clips; untruncated 15s@44.1k is heavy
+
+# ============ legacy flat data fields (fallback when `data:` is absent) ============
+train_set_path: data/train_sources_2025
+train_set_dynamic_mixing: true
+valid_set_path: data/val_2025
+max_duration: 96000
+use_high_pass: true
+
+# ================= training =================
+batch_size: 4
+num_worker: 8                   # on-the-fly simulation is CPU-bound; increase if GPU starves
+val_check_interval: 5000
+device: "cuda"
+num_gpu: 1
+learning_rate: 1.0e-3
+lr_step_size: 1
+lr_gamma: 0.85
+gradient_clip: 0.5
+weight_decay: 1.0e-6
+adam_epsilon: 1.0e-8
+num_train_epochs: 80            # treat as an upper bound; rely on checkpoint selection
+train_version: 0
+train_name: 'bsrnn_2025dm'
+save_top_k: 5
+resume: true
+seed: 2024
+
+# ================= model =================
+# BSRNN: 62.16 GMACs @16kHz / 78.43 GMACs @48kHz, ~38M params
+# BS=2 needs ~14GB GPU memory; reduce batch_size if OOM
+model_type: "discriminative"
+init_from: 'none'               # e.g. official ckpt for finetuning
+se_model: bsrnn
+model_configs:
+  num_channel: 196
+  num_layer: 6

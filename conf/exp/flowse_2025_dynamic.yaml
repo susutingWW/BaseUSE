@@ -1,0 +1,69 @@
+# BaseUSE experiment: BSRNN-Flow (generative FlowSE) on URGENT 2025 data, dynamic mixing
+#
+# Usage:
+#   python -m baseuse.train --config_file conf/exp/flowse_2025_dynamic.yaml
+
+data:
+  train:
+    type: dynamic_mixing
+    path: data/train_sources_2025
+    max_duration: 96000
+    use_high_pass: true
+    retry_when_fails: true
+    simulation: {}               # empty -> official 2026 baseline defaults
+  validation:
+    type: pre_simulated
+    path: data/val_2025
+    max_duration: 96000      # cap val clips (random 96000-sample window);
+                             # untruncated 15s@44.1k clips are memory-hungry
+
+train_set_path: data/train_sources_2025
+train_set_dynamic_mixing: true
+valid_set_path: data/val_2025
+max_duration: 96000
+use_high_pass: true
+
+batch_size: 4
+num_worker: 32
+val_check_interval: 5000
+device: "cuda"
+num_gpu: 1
+learning_rate: 1.0e-4
+lr_step_size: 1
+lr_gamma: 0.85
+gradient_clip: 0.5
+weight_decay: 1.0e-6
+adam_epsilon: 1.0e-8
+num_train_epochs: 80
+train_version: 0
+train_name: 'flowse_2025dm'
+save_top_k: 5
+resume: true
+seed: 20250
+
+# flow related
+ema_decay: 0.999
+theta: 1.5
+sigma_max: 0.5
+sigma_min: 0.05
+t_eps: 0.03
+T_rev: 1.0
+loss_type: 'mse'
+loss_abs_exponent: 0.5
+
+# STFT
+n_fft: 1536
+hop_length: 384
+spec_transform_type: 'exponent'
+spec_abs_exponent: 0.667
+spec_factor: 0.065
+
+# BSRNN
+model_type: "flowse"
+init_from: 'none'
+bsrnn_hidden: 384
+num_layer: 6
+# recompute BSRNN layer activations in backward: ~6x activation memory cut,
+# ~30% slower steps. Required for worst-case batches (96000 samples @ 8kHz
+# = 12s = 1501 STFT frames), which otherwise OOM an 80GB GPU.
+gradient_checkpointing: true

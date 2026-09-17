@@ -1,0 +1,181 @@
+# BaseUSE experiment: RWSAMamba-UNet (pure-Mamba variant, no attention / no GAN)
+# trained on URGENT 2025 data, dynamic mixing, multi-sampling-rate via SFI-STFT.
+#
+# Usage:
+#   python -m baseuse.train --config_file conf/exp/rwsamamba_2025_dynamic.yaml
+#
+# Model: https://github.com/NikolaiKyhne/RWSAMamba-UNet (ICASSP 2026)
+# - use_rwsa: false  -> TFMambaBlock everywhere (attention removed; the
+#   paper's pure-Mamba ablation backbone). Set true to restore the shared
+#   attention (needs much more memory on long segments: O(T^2) attention).
+# - No GAN: the MetricDiscriminator / metric loss / PESQ-in-the-loop of the
+#   upstream trainer are dropped; the generator keeps the official loss
+#   weights (mag 0.9 / phase 0.3 / complex 0.1 / time 0.2 / consistency 0.1).
+# - SFI-STFT: espnet STFTEncoder/Decoder reconfigure n_fft/win/hop per input
+#   fs with fixed duration (ref 16 kHz: 510/510/120 -> 31.875 ms / 7.5 ms
+#   hop / ~31.4 Hz bins at every 8k-48k rate); LearnableSigmoid2D keeps one
+#   frequency table sized for 48 kHz, sliced at runtime.
+  # - Optimizer follows the upstream recipe (AdamW 5e-4, betas (0.8, 0.99),
+  #   wd 0.01); lr decays per-step to lr_decay_factor over lr_decay_steps
+  #   (per-step decay is epoch-size independent; with balanced sampling an
+  #   epoch is ~1250 steps, see data.train.sampling below).
+
+# ================= data (same recipe as bsrnn_2025_dynamic.yaml) =================
+data:
+  train:
+    type: dynamic_mixing
+    path: data/train_sources_2025
+    max_duration: 96000          # sample-count cap (2s @ 48kHz / 12s @ 8kHz)
+    max_duration_sec: 4.0        # seconds cap: keeps T<=~536 frames at every fs.
+                                 # Even without attention, activations scale
+                                 # linearly with T: uncapped 12s @ 8k batches
+                                 # need >>24GB at batch_size 4. 4s ~= 2x the
+                                 # upstream paper's 1.92s segments.
+    use_high_pass: true
+    retry_when_fails: true       # fall back to clean speech if simulation fails
+    # GAP-URGENet style epoch sampling: each epoch draws num_per_epoch
+    # utterances WITH REPLACEMENT, split evenly across the 6 corpus pools
+    # (dns5_fullband/vctk/libritts/commonvoice/mls_segments/ears; 60.6% of
+    # the corpus is CommonVoice, so a full pass heavily over-samples it).
+    # Data budget: 40 epochs x 40k = 1.6M 4s-segments (~1.9x GAP predictor's
+    # 844k). With 4 GPUs x bs=8 (global 32) one epoch is 40000/32 = 1250
+    # optimizer steps; 40 epochs = 50k steps.
+    # Remove this block (or strategy: full) to restore the legacy full pass.
+    sampling:
+      strategy: balanced         # 'full' = iterate whole corpus (legacy)
+      num_per_epoch: 40000
+      # pool_keywords: [dns5_fullband, vctk, libritts, commonvoice, mls_segments, ears]
+    simulation:                  # defaults replicate the official 2026 baseline
+      snr_low_bound: -5.0
+      snr_high_bound: 20.0
+      reuse_noise: true
+      prob_wind_noise: 0.05
+      prob_reverberation: 0.5
+      reuse_rir: true
+      num_augmentations:
+        0: 0.25
+        1: 0.40
+        2: 0.20
+        3: 0.15
+      wind_noise_config:
+        threshold: [0.1, 0.3]
+        ratio: [1, 20]
+        attack: [5, 100]
+        release: [5, 100]
+        sc_gain: [0.8, 1.2]
+        clipping_threshold: [0.85, 1.0]
+        clipping_chance: 0.75
+        wind_noise_snr_low_bound: -10.0
+        wind_noise_snr_high_bound: 15.0
+      augmentations:
+        bandwidth_limitation:
+          weight: 1.0
+          resample_methods: random
+        clipping:
+          weight: 1.0
+          clipping_min_quantile: [0.0, 0.1]
+          clipping_max_quantile: [0.9, 1.0]
+        codec:
+          weight: 1.0
+          config:
+            - format: mp3
+              encoder: null
+              qscale: [1, 10]
+            - format: ogg
+              encoder: [vorbis]
+              qscale: [1, 10]
+        packet_loss:
+          weight: 1.0
+          packet_duration_ms: 20
+          max_continuous_packet_loss: 10
+          packet_loss_rate: [0.05, 0.25]
+  validation:
+    type: pre_simulated
+    path: data/val_2025          # built from urgent2025 data/validation
+    max_duration: -1             # no truncation: evaluate full-length clips
+    max_duration_sec: null       # (longest is ~15s @ 44.1k; inference keeps only
+                                 # transient activations, so full-length val
+                                 # costs time, not much GPU memory)
+
+# ============ legacy flat data fields (fallback when `data:` is absent) ============
+train_set_path: data/train_sources_2025
+train_set_dynamic_mixing: true
+valid_set_path: data/val_2025
+max_duration: 96000
+use_high_pass: true
+
+# ================= training =================
+# 4-GPU DDP, data budget ~= GAP-URGENet predictor (880k 4s-segments):
+#   global batch = 4 x 8 = 32  (== upstream single-GPU bs=32, so the
+#   lr=5e-4 recipe stays valid without re-tuning)
+#   steps/epoch = 40000 / 32 = 1250;  22 epochs -> 27,500 steps total.
+batch_size: 8                     # PER GPU. 8 x 2.5-4GB/sample (bf16+gc)
+                                   # = 20-32GB: safe on 80GB cards. Raising
+                                   # this to 16/32 also raises the GLOBAL
+                                   # batch (lr should then be re-scaled) and
+                                   # cuts the number of optimizer updates.
+num_worker: 32                    # PER RANK (4 ranks = 128 sim workers);
+                                   # on-the-fly simulation is CPU-bound, trim
+                                   # to cores/4 if the node oversubscribes
+val_check_interval: 1200          # 1250 steps/epoch -> ~1 val/epoch (GAP
+                                   # cadence); must stay <= epoch length (PL
+                                   # raises otherwise). Val set: 2168 clips,
+                                   # full-length, replicated on every rank.
+device: "cuda"
+num_gpu: 4
+precision: "bf16-mixed"           # halves activation memory + tensor cores;
+                                  # M403 (Ampere+) supports bf16 natively
+learning_rate: 5.0e-4            # upstream RWSA_MambaUNet_s.yaml
+lr_step_size: 1
+lr_gamma: 0.99                   # fallback per-epoch decay (only if lr_decay_steps=0)
+lr_decay_steps: 50000            # == total optimizer steps (40 epochs x 1250):
+                                  # lr ends at 0.1 x 5e-4 = 5e-5 exactly at
+                                  # the end of training (50k steps).
+lr_decay_factor: 0.1             # lr decays to 10% of initial at lr_decay_steps
+weight_decay: 0.01               # upstream (AdamW default, unspecified there)
+gradient_clip: 0.5               # upstream trainer did not clip; kept for safety
+num_train_epochs: 40             # 40 x 40k = 1.6M samples (~1.9x GAP predictor
+                                  # total; best val ckpt kept via save_top_k)
+train_version: 3                 # v0 = NaN-storm abort (fp32 bs=2); v1 = 23min
+                                  # abort; v2 = 4-GPU DDP deadlock (unequal
+                                  # per-rank epoch lengths pre-fix; lost ~2
+                                  # epochs, restart clean)
+train_name: 'rwsamamba_2025dm'
+save_top_k: 5
+resume: true
+seed: 2024
+
+# ================= model =================
+# RWSA_MambaUNet_s size: ~2.4M params. SFI reference rates: see file header.
+model_type: "discriminative"
+init_from: 'none'
+se_model: rwsamamba_unet
+model_configs:
+  hid_feature: 16
+  num_tfmamba: 4
+  d_state: 16
+  d_conv: 4
+  expand: 4
+  norm_epsilon: 1.0e-5
+  beta: 2.0
+  compress_factor: 0.3
+  use_rwsa: false                # false = pure Mamba (attention removed)
+  grad_checkpoint: true          # recompute TFMamba stacks in backward:
+                                 # ~2-3x less activation memory, ~25% slower.
+                                 # train-only; inference unaffected
+  mamba_fp32: true               # run Mamba scans in fp32 inside bf16 autocast:
+                                 # the selective-scan backward is a NaN source in
+                                 # bf16 (was ~30% of steps dropped). false = full
+                                 # bf16, faster; watch the NaN print to A/B it
+  # SFI-STFT (reference at 16 kHz; window/hop duration kept across fs)
+  base_fs: 16000
+  n_fft: 510
+  hop_length: 120
+  win_length: 510
+  max_fs: 48000
+  # generator loss weights (upstream training_cfg.loss, metric term dropped)
+  loss_mag: 0.9
+  loss_pha: 0.3
+  loss_com: 0.1
+  loss_time: 0.2
+  loss_con: 0.1

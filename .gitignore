@@ -1,26 +1,52 @@
+# ================= Python =================
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 .eggs/
 build/
 dist/
+*.egg
+.venv/
+venv/
+.env
 
-# experiment outputs
-exp/
-!exp/.gitkeep
+# ================= Experiment outputs =================
+# Anchored to repo root: an unanchored `exp/` would also swallow conf/exp/.
+/exp/*
+!/exp/.gitkeep
 
-# data manifests and simulated audio (audio always lives outside this repo)
-data/*
-!data/.gitkeep
+# Training logs (e.g. train_*.log at the root, nohup logs)
+*.log
+nohup.out
 
-# checkpoints and tensorboard
+# Checkpoints and model files
 *.ckpt
 *.pth
+*.pt
+*.onnx
+
+# Lightning / TensorBoard artifacts
 lightning_logs/
 tensorboard/
+events.out.tfevents.*
 
-# temporary simulation files
-simulation_tmp/
-simulation_train/
-simulation_validation/
+# ================= Data =================
+# Manifests contain machine-specific absolute paths; audio always lives
+# outside this repo.
+/data/*
+!/data/.gitkeep
+
+# ================= Simulation scratch =================
+/simulation_tmp/
+/simulation_train/
+/simulation_validation/
 .cache/
+
+# ================= Editors / OS =================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
