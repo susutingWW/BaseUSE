@@ -1,0 +1,15 @@
+# Base training environment (mirrors urgent2026_challenge_track1 setup.py)
+# Create an isolated env, e.g.:
+#   conda create -n baseuse python=3.10
+#   conda activate baseuse
+#   conda install ffmpeg        # required by on-the-fly simulation (wind noise / codec)
+#   pip install -e ./
+#
+# Evaluation dependencies are separate (heavier, conflicting pins):
+#   pip install pip==24.0
+#   pip install -r baseuse/evaluation/requirements.txt
+#
+# RWSAMamba-UNet model (conf/exp/rwsamamba_2025_dynamic.yaml) additionally needs:
+#   pip install torchvision==0.17.1 causal-conv1d>=1.2.0 mamba-ssm==1.2.2
+# (torchvision must match torch 2.2.1; if no mamba-ssm wheel matches your
+#  torch/CUDA build, install from the upstream repo's mamba_install/ instead)

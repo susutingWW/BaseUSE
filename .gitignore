@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# experiment outputs
+exp/
+!exp/.gitkeep
+
+# data manifests and simulated audio (audio always lives outside this repo)
+data/*
+!data/.gitkeep
+
+# checkpoints and tensorboard
+*.ckpt
+*.pth
+lightning_logs/
+tensorboard/
+
+# temporary simulation files
+simulation_tmp/
+simulation_train/
+simulation_validation/
+.cache/
